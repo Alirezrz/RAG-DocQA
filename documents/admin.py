@@ -11,3 +11,4 @@ class DocumentChunkAdmin(admin.ModelAdmin):
     
     def content_preview(self, obj):
         return obj.content[:100] + '...'
+    

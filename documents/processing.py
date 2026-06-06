@@ -1,17 +1,16 @@
-"""
-This file handles all document processing:
-1. Extract text from .docx files
-2. Split text into chunks
-3. Generate embeddings for each chunk
-"""
+import re
+import math
+import json
+from collections import Counter
 
 from docx import Document as DocxDocument
 from sentence_transformers import SentenceTransformer
 
+#  Singleton embedding model:
+
 _model = None
 
 def get_model():
-    """Load embedding model once and reuse it."""
     global _model
     if _model is None:
         print("Loading embedding model... (first time only)")
@@ -20,72 +19,159 @@ def get_model():
     return _model
 
 
-def extract_text(file_path):
+#  STEP 1 — Extract rich structure from .docx
+
+def extract_structured_paragraphs(file_path):
     """
-    Extract all text from a .docx file.
-    We join them all with newlines to get the full text.
-    Returns All text as one big string
+    Returns a list of dicts:
+        [{'type': 'heading'|'text', 'text': '...'}, ...]
     """
     doc = DocxDocument(file_path)
+    paragraphs = []
 
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if not text:
+            continue  
 
-    return '\n'.join(paragraphs)
+        style_name = p.style.name.lower() if p.style else ''
+        is_heading  = 'heading' in style_name
+
+        paragraphs.append({
+            'type': 'heading' if is_heading else 'text',
+            'text': text,
+        })
+
+    return paragraphs
 
 
-def split_into_chunks(text: str, chunk_size: int = 80, overlap: int = 15):
+#  STEP 2 — Structure-Aware + Semantic Chunking
 
-    words = text.split()  
-    chunks = []
-    start = 0
+SEMANTIC_SPLIT_THRESHOLD = 0.45
+MAX_CHUNK_WORDS = 600
 
-    while start < len(words):
-        end = start + chunk_size
-        chunk = ' '.join(words[start:end])  
-        chunks.append(chunk)
-        start += chunk_size - overlap      
+
+def semantic_chunk(paragraphs: list):
+    if not paragraphs:
+        return []
+
+    model = get_model()
+    texts = [p['text'] for p in paragraphs]
+    embeddings = model.encode(texts, show_progress_bar=False)  # shape: (N, 384)
+
+    chunks= []
+    current_group = []         
+    current_words = 0
+
+    def flush_group():
+        """Turn current_group into a chunk string and reset."""
+        if current_group:
+            chunk_text = '\n'.join(p['text'] for p in current_group)
+            chunks.append(chunk_text)
+        current_group.clear()
+
+    for i, para in enumerate(paragraphs):
+        word_count = len(para['text'].split())
+
+        if not current_group:
+            current_group.append(para)
+            current_words = word_count
+            continue
+
+
+        split = False
+
+        # Signal 1 — STRUCTURAL: a heading always starts a new chunk
+        if para['type'] == 'heading':
+            split = True
+
+        # Signal 2 — SEMANTIC: meaning shifted between this para and the last
+        if not split:
+            prev_embedding = embeddings[i - 1]
+            curr_embedding = embeddings[i]
+
+            # cosine similarity via numpy dot-product on unit vectors
+            sim = float(
+                (prev_embedding @ curr_embedding) /((prev_embedding @ prev_embedding) ** 0.5 *(curr_embedding @ curr_embedding) ** 0.5 + 1e-9))
+            if sim < SEMANTIC_SPLIT_THRESHOLD:
+                split = True
+                print(f"  [Chunker] Semantic split at para {i} (sim={sim:.2f})")
+
+        # Signal 3 — SIZE: chunk is already big enough, force a cut
+        if current_words + word_count > MAX_CHUNK_WORDS:
+            split = True
+
+        if split:
+            chunk_text = '\n'.join(p['text'] for p in current_group)
+            chunks.append(chunk_text)
+            current_group = [para]
+            current_words = word_count
+        else:
+            current_group.append(para)
+            current_words += word_count
+
+    if current_group:
+        chunks.append('\n'.join(p['text'] for p in current_group))
 
     return chunks
 
 
-def generate_embedding(text: str) -> list:
-    """
-    Convert text into a vector (list of 384 numbers).
-    Similar texts → similar vectors → close together in vector space.
-    """
-    model = get_model()
-    vector = model.encode(text)
-    return vector.tolist()      # convert numpy array to plain Python list
+# ─────────────────────────────────────────────
+#  STEP 3 — BM25 term statistics (for hybrid search)
+# ─────────────────────────────────────────────
 
+def tokenize(text: str):
+    return re.findall(r'[a-zA-Z0-9]+', text.lower())
+
+
+def compute_bm25_stats(text: str, all_chunk_texts: list):
+
+    tokens = tokenize(text)
+    tf     = dict(Counter(tokens))        # {'word': frequency, ...}
+    return tf
+
+
+#  STEP 4 — Embedding
+
+def generate_embedding(text: str) -> list:
+    """Convert text to a 384-dimensional vector."""
+    model  = get_model()
+    vector = model.encode(text)
+    return vector.tolist()
+
+
+#  STEP 5 — Main entry point
 
 def process_document(document):
-    """
-    extract → chunk → embed → save to DB.
-    """
+
     from documents.models import DocumentChunk
 
-    print(f"Processing: {document.title}")
+    print(f"\nProcessing: {document.title}")
 
-    text = extract_text(document.file.path)
-    document.extracted_text = text
+    # 1. Extract structured paragraphs (with heading tags)
+    paragraphs = extract_structured_paragraphs(document.file.path)
+    full_text  = '\n'.join(p['text'] for p in paragraphs)
+
+    document.extracted_text = full_text
     document.save()
-    print(f"  Extracted {len(text)} characters")
+    print(f"  Extracted {len(paragraphs)} paragraphs ({len(full_text)} chars)")
 
     document.chunks.all().delete()
 
-    chunks = split_into_chunks(text)
-    print(f"  Split into {len(chunks)} chunks")
+    chunk_texts = semantic_chunk(paragraphs)
+    print(f"  Created {len(chunk_texts)} smart chunks")
 
-    # Step 4: For each chunk, generate embedding and save to DB
-    for index, chunk_text in enumerate(chunks):
-        embedding = generate_embedding(chunk_text)  # we are turning chunks into vectors here 
+    for index, chunk_text in enumerate(chunk_texts):
+        embedding = generate_embedding(chunk_text)
+        bm25_tf   = compute_bm25_stats(chunk_text, chunk_texts)  # term frequencies
 
         chunk = DocumentChunk(
-            document=document,
-            content=chunk_text,
-            chunk_index=index,
+            document    = document,
+            content     = chunk_text,
+            chunk_index = index,
         )
         chunk.set_embedding(embedding)
+        chunk.set_bm25_tf(bm25_tf)     
         chunk.save()
 
-    print(f"  Done! Saved {len(chunks)} chunks with embeddings")
+    print(f"  Done! Saved {len(chunk_texts)} chunks with embeddings + BM25 stats")
