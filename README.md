@@ -706,6 +706,3 @@ The system is production-capable for small to medium document sets. Here are the
 
 ---
 
-## License
-
-MIT
